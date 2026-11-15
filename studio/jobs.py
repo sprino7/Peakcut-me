@@ -11,7 +11,7 @@ import traceback
 import uuid
 from pathlib import Path
 
-from . import brain, config, creators, ctx, load, media, render, roman, safe, transcribe, usage
+from . import brain, config, creators, ctx, ending, load, media, render, roman, safe, transcribe, usage
 
 class _FairQueue:
     """Whose video is next. Each person has their own line and the lines take turns, so someone who adds ten
@@ -148,7 +148,7 @@ def public(job) -> dict:
     """What the browser may see: no server paths, no owner id."""
     out = {k: v for k, v in job.items() if k not in HIDDEN}
     out["source"] = {k: v for k, v in job["source"].items() if k != "path"}
-    out["clips"] = [{k: v for k, v in c.items() if k not in ("src", "fixed_words", "fixed_for")} for c in job["clips"]]
+    out["clips"] = [{k: v for k, v in c.items() if k not in ("src", "fixed_words", "fixed_for", "ending_diag")} for c in job["clips"]]
     ai = job.get("ai") or {}
     out["ai"] = {"tokens": ai.get("tokens", 0), "note": ai.get("note", ""), "used": bool(ai.get("model"))}   # never the model, never raw errors
     if job.get("status") == "queued":
@@ -459,6 +459,57 @@ def _covers(words: list, start: float, end: float) -> bool:
     return len(inside) >= 25 * minutes and inside[-1]["s"] >= start + 0.85 * (end - start)
 
 
+def refine_clip_ending(start: float, end: float, words: list, audio=None,
+                       min_len: float = 15.0, max_len: float = 60.0,
+                       duration: float = 0.0) -> tuple:
+    """Refine an already-selected clip's end timestamp using the Smart Ending engine.
+    Ensures start timestamp is never modified, duration limits are strictly preserved,
+    and falls back safely to original end if refinement encounters any error."""
+    orig_end = round(float(end), 2)
+    try:
+        res = ending.refine_clip_endpoint(
+            start=start,
+            end=orig_end,
+            words=words,
+            audio=audio,
+            audio_offset=0.0,
+            min_len=min_len,
+            max_len=max_len,
+            video_duration=duration,
+        )
+        refined = res.end
+
+        if duration > 0 and start + min_len > duration:
+            return orig_end, {
+                "original_end": orig_end,
+                "refined_end": orig_end,
+                "changed": False,
+                "reason": "video_duration_shorter_than_min_len_preserved",
+                "audio_status": "insufficient_context",
+            }
+
+        hard_min = start + min_len
+        hard_max = min(start + max_len, duration) if duration > 0 else (start + max_len)
+
+        refined = round(max(hard_min, min(refined, hard_max)), 2)
+        diag = {
+            "original_end": orig_end,
+            "refined_end": refined,
+            "changed": abs(refined - orig_end) > 0.02,
+            "reason": res.reason,
+            "audio_status": res.audio_status,
+        }
+        return refined, diag
+    except Exception as e:  # noqa: BLE001 - keep original endpoint on any unexpected error
+        return orig_end, {
+            "original_end": orig_end,
+            "refined_end": orig_end,
+            "changed": False,
+            "reason": f"fallback_error: {e}",
+            "audio_status": "error",
+        }
+
+
 def _run_job(job):
     import math
     from concurrent.futures import ThreadPoolExecutor
@@ -634,8 +685,21 @@ def _run_job(job):
         if ai.get("note"):
             notes.append(ai["note"])
         for c in found:
-            c.update(id=f"clip{len(job['clips']) + 1:02d}", start=round(c["start"] + shift, 2),
-                     end=round(c["end"] + shift, 2), style=o["style"], layout=o["layout"], status="queued", version=0)
+            c_start = round(c["start"] + shift, 2)
+            orig_end = round(c["end"] + shift, 2)
+            c_end, diag = refine_clip_ending(
+                start=c_start,
+                end=orig_end,
+                words=words,
+                audio=audio,
+                min_len=float(o["min_len"]),
+                max_len=float(o["max_len"]),
+                duration=float(job.get("duration") or 0.0),
+            )
+            c.update(id=f"clip{len(job['clips']) + 1:02d}", start=c_start,
+                     end=c_end, style=o["style"], layout=o["layout"], status="queued", version=0)
+            if diag:
+                c["ending_diag"] = diag
             job["clips"].append(c)
             futures.append(renders.submit(ctx.bind(make), c, list(words)))
         job["ai"] = {"model": model, "tokens": tokens, "note": "", "log": notes[-5:]}
